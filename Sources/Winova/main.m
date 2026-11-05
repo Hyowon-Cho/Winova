@@ -13,13 +13,16 @@ static NSError *WinovaError(NSString *message) {
 
 @interface WinovaRuntime : NSObject
 @property(nonatomic, strong, readonly) NSURL *prefixURL;
+@property(nonatomic, strong, readonly) NSURL *prefixRootURL;
 @property(nonatomic, copy) WinovaLogHandler logHandler;
 @property(nonatomic, copy) WinovaStatusHandler statusHandler;
 - (NSString *)enginePath;
 - (void)selectEngine:(NSString *)path;
 - (void)reportEngineStatus;
+- (NSArray<NSDictionary *> *)installedApplications;
 - (void)prepareEnvironment:(WinovaCompletion)completion;
 - (void)launchProgram:(NSURL *)program completion:(WinovaCompletion)completion;
+- (void)launchInstalledApplication:(NSDictionary *)application completion:(WinovaCompletion)completion;
 - (void)openConfiguration:(WinovaCompletion)completion;
 @end
 
@@ -35,9 +38,9 @@ static NSError *WinovaError(NSString *message) {
         _tasks = [NSMutableDictionary dictionary];
         NSURL *base = [[[NSFileManager defaultManager] URLsForDirectory:NSApplicationSupportDirectory
                                                                inDomains:NSUserDomainMask] firstObject];
-        _prefixURL = [[[[base URLByAppendingPathComponent:@"Winova" isDirectory:YES]
-            URLByAppendingPathComponent:@"Prefixes" isDirectory:YES]
-            URLByAppendingPathComponent:@"default" isDirectory:YES] copy];
+        _prefixRootURL = [[[base URLByAppendingPathComponent:@"Winova" isDirectory:YES]
+            URLByAppendingPathComponent:@"Prefixes" isDirectory:YES] copy];
+        _prefixURL = [[_prefixRootURL URLByAppendingPathComponent:@"default" isDirectory:YES] copy];
         [[NSFileManager defaultManager] createDirectoryAtURL:_prefixURL
                                  withIntermediateDirectories:YES
                                                   attributes:nil
@@ -60,7 +63,9 @@ static NSError *WinovaError(NSString *message) {
     [candidates addObjectsFromArray:@[
         @"/opt/homebrew/bin/wine",
         @"/usr/local/bin/wine",
+        @"/Applications/Wine Devel.app/Contents/Resources/wine/bin/wine",
         @"/Applications/Wine Stable.app/Contents/Resources/wine/bin/wine",
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/Wine Devel.app/Contents/Resources/wine/bin/wine"],
         [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/Wine Stable.app/Contents/Resources/wine/bin/wine"]
     ]];
     for (NSString *path in candidates) {
@@ -103,9 +108,24 @@ static NSError *WinovaError(NSString *message) {
     });
 }
 
-- (NSMutableDictionary *)runtimeEnvironment:(NSString *)engine {
+- (NSURL *)prefixURLForName:(NSString *)prefixName {
+    NSString *safeName = prefixName.lastPathComponent.length ? prefixName.lastPathComponent : @"default";
+    return [self.prefixRootURL URLByAppendingPathComponent:safeName isDirectory:YES];
+}
+
+- (NSString *)prefixNameContainingPath:(NSString *)path {
+    NSString *root = [self.prefixRootURL.path stringByStandardizingPath];
+    NSString *candidate = [path stringByStandardizingPath];
+    NSString *rootWithSlash = [root stringByAppendingString:@"/"];
+    if (![candidate hasPrefix:rootWithSlash]) return @"default";
+    NSString *relative = [candidate substringFromIndex:rootWithSlash.length];
+    NSString *name = relative.pathComponents.firstObject;
+    return name.length ? name : @"default";
+}
+
+- (NSMutableDictionary *)runtimeEnvironment:(NSString *)engine prefixName:(NSString *)prefixName {
     NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
-    environment[@"WINEPREFIX"] = self.prefixURL.path;
+    environment[@"WINEPREFIX"] = [self prefixURLForName:prefixName].path;
     environment[@"WINEDEBUG"] = @"-all";
     NSString *engineDirectory = [engine stringByDeletingLastPathComponent];
     NSString *oldPath = environment[@"PATH"] ?: @"";
@@ -116,12 +136,13 @@ static NSError *WinovaError(NSString *message) {
 
 - (NSTask *)taskWithEngine:(NSString *)engine
                   arguments:(NSArray<NSString *> *)arguments
-           workingDirectory:(NSURL *)directory {
+           workingDirectory:(NSURL *)directory
+                 prefixName:(NSString *)prefixName {
     NSTask *task = [NSTask new];
     task.executableURL = [NSURL fileURLWithPath:engine];
     task.arguments = arguments;
     task.currentDirectoryURL = directory;
-    task.environment = [self runtimeEnvironment:engine];
+    task.environment = [self runtimeEnvironment:engine prefixName:prefixName];
     NSPipe *pipe = [NSPipe pipe];
     task.standardOutput = pipe;
     task.standardError = pipe;
@@ -135,6 +156,201 @@ static NSError *WinovaError(NSString *message) {
     return task;
 }
 
+- (NSString *)urlTargetAtURL:(NSURL *)url {
+    NSData *data = [NSData dataWithContentsOfURL:url];
+    if (!data.length) return nil;
+    NSArray<NSNumber *> *encodings = @[@(NSUTF8StringEncoding), @(NSUTF16LittleEndianStringEncoding),
+                                       @(NSWindowsCP1252StringEncoding)];
+    NSString *contents = nil;
+    for (NSNumber *encoding in encodings) {
+        contents = [[NSString alloc] initWithData:data encoding:encoding.unsignedIntegerValue];
+        if (contents.length) break;
+    }
+    for (NSString *line in [contents componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        if ([line.uppercaseString hasPrefix:@"URL="]) {
+            return [[line substringFromIndex:4] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        }
+    }
+    return nil;
+}
+
+- (NSString *)decodedRegistryValue:(NSString *)value {
+    NSString *decoded = [value stringByReplacingOccurrencesOfString:@"\\\"" withString:@"\""];
+    return [decoded stringByReplacingOccurrencesOfString:@"\\\\" withString:@"\\"];
+}
+
+- (NSString *)registryValueForLine:(NSString *)line name:(NSString *)name {
+    NSString *prefix = [NSString stringWithFormat:@"\"%@\"=\"", name];
+    if (![line hasPrefix:prefix] || ![line hasSuffix:@"\""] || line.length <= prefix.length) return nil;
+    NSString *value = [line substringWithRange:NSMakeRange(prefix.length, line.length - prefix.length - 1)];
+    return [self decodedRegistryValue:value];
+}
+
+- (NSURL *)fileURLForWindowsPath:(NSString *)windowsPath prefixURL:(NSURL *)prefixURL {
+    NSString *path = [windowsPath stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if ([path hasPrefix:@"\""] && [path hasSuffix:@"\""] && path.length > 1) {
+        path = [path substringWithRange:NSMakeRange(1, path.length - 2)];
+    }
+    NSRange comma = [path rangeOfString:@"," options:NSBackwardsSearch];
+    if (comma.location != NSNotFound) {
+        NSString *suffix = [path substringFromIndex:comma.location + 1];
+        if ([[suffix stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]
+             rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet.invertedSet].location == NSNotFound) {
+            path = [path substringToIndex:comma.location];
+        }
+    }
+    if (path.length >= 3 && [[path substringToIndex:3].lowercaseString isEqualToString:@"c:\\"]) {
+        NSString *relative = [[path substringFromIndex:3] stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+        return [[prefixURL URLByAppendingPathComponent:@"drive_c" isDirectory:YES]
+            URLByAppendingPathComponent:relative];
+    }
+    return nil;
+}
+
+- (NSArray<NSDictionary *> *)registryApplicationsForPrefixURL:(NSURL *)prefixURL {
+    NSMutableArray<NSDictionary *> *applications = [NSMutableArray array];
+    for (NSString *registryName in @[@"system.reg", @"user.reg"]) {
+        NSURL *registryURL = [prefixURL URLByAppendingPathComponent:registryName];
+        NSString *contents = [NSString stringWithContentsOfURL:registryURL encoding:NSUTF8StringEncoding error:nil];
+        if (!contents.length) continue;
+        BOOL uninstallSection = NO;
+        NSString *displayName = nil;
+        NSString *displayIcon = nil;
+        for (NSString *line in [contents componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+            if ([line hasPrefix:@"["]) {
+                if (uninstallSection && displayName.length) {
+                    [applications addObject:@{@"name": displayName, @"icon": displayIcon ?: @""}];
+                }
+                uninstallSection = [line.lowercaseString containsString:@"\\\\uninstall\\\\"];
+                displayName = nil;
+                displayIcon = nil;
+                continue;
+            }
+            if (!uninstallSection) continue;
+            NSString *nameValue = [self registryValueForLine:line name:@"DisplayName"];
+            NSString *iconValue = [self registryValueForLine:line name:@"DisplayIcon"];
+            if (nameValue) displayName = nameValue;
+            if (iconValue) displayIcon = iconValue;
+        }
+        if (uninstallSection && displayName.length) {
+            [applications addObject:@{@"name": displayName, @"icon": displayIcon ?: @""}];
+        }
+    }
+    return applications;
+}
+
+- (BOOL)isUsefulApplicationName:(NSString *)name {
+    NSString *lower = name.lowercaseString;
+    for (NSString *word in @[@"uninstall", @"readme", @"website", @"help", @"manual",
+                             @"redistributable", @"runtime", @"webview", @"driver", @"update",
+                             @"component", @"support package"]) {
+        if ([lower containsString:word]) return NO;
+    }
+    return name.length > 0;
+}
+
+- (BOOL)isUsefulExecutablePath:(NSString *)path {
+    NSString *name = path.lastPathComponent.lowercaseString;
+    if (![name.pathExtension isEqualToString:@"exe"]) return NO;
+    for (NSString *word in @[@"unins", @"uninstall", @"setup", @"update", @"crash", @"helper", @"service"] ) {
+        if ([name containsString:word]) return NO;
+    }
+    return YES;
+}
+
+- (NSURL *)artworkURLNearExecutable:(NSURL *)executableURL displayName:(NSString *)displayName {
+    if (!executableURL) return nil;
+    NSURL *directory = executableURL.URLByDeletingLastPathComponent;
+    NSString *compactName = [[displayName lowercaseString] stringByReplacingOccurrencesOfString:@" " withString:@""];
+    NSArray<NSString *> *candidates = @[
+        @"dist/icon.png", @"icon.png", @"favicon.ico",
+        [NSString stringWithFormat:@"%@.ico", compactName],
+        [NSString stringWithFormat:@"public/%@_tray.ico", compactName],
+        [NSString stringWithFormat:@"public/%@.ico", compactName]
+    ];
+    for (NSString *relativePath in candidates) {
+        NSURL *candidate = [directory URLByAppendingPathComponent:relativePath];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:candidate.path]) return candidate;
+    }
+    return nil;
+}
+
+- (NSArray<NSDictionary *> *)installedApplications {
+    NSFileManager *files = [NSFileManager defaultManager];
+    NSArray<NSURL *> *prefixes = [files contentsOfDirectoryAtURL:self.prefixRootURL
+                                      includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+                                                         options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                           error:nil] ?: @[];
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *found = [NSMutableDictionary dictionary];
+    for (NSURL *prefixURL in prefixes) {
+        NSNumber *isDirectory = nil;
+        [prefixURL getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
+        if (!isDirectory.boolValue || ![files fileExistsAtPath:[prefixURL URLByAppendingPathComponent:@"drive_c"].path]) continue;
+        NSString *prefixName = prefixURL.lastPathComponent;
+        NSMutableArray<NSURL *> *menuRoots = [NSMutableArray arrayWithObject:
+            [prefixURL URLByAppendingPathComponent:@"drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs" isDirectory:YES]];
+        NSURL *usersURL = [prefixURL URLByAppendingPathComponent:@"drive_c/users" isDirectory:YES];
+        for (NSURL *userURL in [files contentsOfDirectoryAtURL:usersURL
+                                    includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+                                                       options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                         error:nil] ?: @[]) {
+            [menuRoots addObject:[userURL URLByAppendingPathComponent:@"AppData/Roaming/Microsoft/Windows/Start Menu/Programs"
+                                                          isDirectory:YES]];
+        }
+        for (NSURL *menuRoot in menuRoots) {
+            NSDirectoryEnumerator<NSURL *> *enumerator = [files enumeratorAtURL:menuRoot
+                                                     includingPropertiesForKeys:@[NSURLIsRegularFileKey]
+                                                                        options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                                   errorHandler:nil];
+            for (NSURL *shortcutURL in enumerator) {
+                NSString *extension = shortcutURL.pathExtension.lowercaseString;
+                if (![@[@"lnk", @"url"] containsObject:extension]) continue;
+                NSString *name = shortcutURL.lastPathComponent.stringByDeletingPathExtension;
+                if (![self isUsefulApplicationName:name]) continue;
+                NSString *kind = @"shortcut";
+                NSString *launch = shortcutURL.path;
+                if ([extension isEqualToString:@"url"]) {
+                    NSString *target = [self urlTargetAtURL:shortcutURL];
+                    if (!target.length) continue;
+                    NSString *lowerTarget = target.lowercaseString;
+                    if ([lowerTarget hasPrefix:@"http://"] || [lowerTarget hasPrefix:@"https://"]) continue;
+                    kind = @"uri";
+                    launch = target;
+                }
+                NSString *key = [NSString stringWithFormat:@"%@|%@", prefixName.lowercaseString, name.lowercaseString];
+                if (!found[key] || [kind isEqualToString:@"uri"]) {
+                    found[key] = [@{@"name": name, @"prefix": prefixName, @"kind": kind,
+                                    @"launch": launch, @"location": shortcutURL.path} mutableCopy];
+                }
+            }
+        }
+        for (NSDictionary *registryApplication in [self registryApplicationsForPrefixURL:prefixURL]) {
+            NSString *name = registryApplication[@"name"];
+            if (![self isUsefulApplicationName:name]) continue;
+            NSURL *iconURL = [self fileURLForWindowsPath:registryApplication[@"icon"] prefixURL:prefixURL];
+            NSURL *artworkURL = [self artworkURLNearExecutable:iconURL displayName:name];
+            NSString *key = [NSString stringWithFormat:@"%@|%@", prefixName.lowercaseString, name.lowercaseString];
+            NSMutableDictionary *existing = found[key];
+            BOOL usableIcon = iconURL && [files fileExistsAtPath:iconURL.path] && [self isUsefulExecutablePath:iconURL.path];
+            if (existing) {
+                if (artworkURL) existing[@"iconPath"] = artworkURL.path;
+                else if (usableIcon) existing[@"iconPath"] = iconURL.path;
+                if (usableIcon && [existing[@"kind"] isEqualToString:@"shortcut"]) {
+                    existing[@"kind"] = @"file";
+                    existing[@"launch"] = iconURL.path;
+                }
+            } else if (usableIcon) {
+                found[key] = [@{@"name": name, @"prefix": prefixName, @"kind": @"file",
+                                @"launch": iconURL.path, @"location": iconURL.path,
+                                @"iconPath": iconURL.path} mutableCopy];
+            }
+        }
+    }
+    return [found.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+        return [left[@"name"] localizedCaseInsensitiveCompare:right[@"name"]];
+    }];
+}
+
 - (void)prepareEnvironment:(WinovaCompletion)completion {
     NSString *engine = self.enginePath;
     if (!engine) {
@@ -143,7 +359,10 @@ static NSError *WinovaError(NSString *message) {
     }
     dispatch_async(_queue, ^{
         [self writeLog:@"Preparing the default Windows environment…"];
-        NSTask *task = [self taskWithEngine:engine arguments:@[@"wineboot", @"-u"] workingDirectory:nil];
+        NSTask *task = [self taskWithEngine:engine
+                                  arguments:@[@"wineboot", @"-u"]
+                           workingDirectory:nil
+                                 prefixName:@"default"];
         NSError *error = nil;
         [task launchAndReturnError:&error];
         [task waitUntilExit];
@@ -162,11 +381,13 @@ static NSError *WinovaError(NSString *message) {
         return;
     }
     BOOL installer = [program.pathExtension.lowercaseString isEqualToString:@"msi"];
-    NSArray *arguments = installer ? @[@"msiexec", @"/i", program.path] : @[program.path];
+    NSArray *arguments = installer ? @[@"msiexec", @"/i", program.path] : @[@"start", @"/unix", program.path];
+    NSString *prefixName = [self prefixNameContainingPath:program.path];
     dispatch_async(_queue, ^{
         NSTask *task = [self taskWithEngine:engine
                                   arguments:arguments
-                           workingDirectory:program.URLByDeletingLastPathComponent];
+                           workingDirectory:program.URLByDeletingLastPathComponent
+                                 prefixName:prefixName];
         [self writeLog:[NSString stringWithFormat:@"Launching %@", program.lastPathComponent]];
         NSError *error = nil;
         [task launchAndReturnError:&error];
@@ -187,6 +408,55 @@ static NSError *WinovaError(NSString *message) {
     });
 }
 
+- (void)launchInstalledApplication:(NSDictionary *)application completion:(WinovaCompletion)completion {
+    NSString *engine = self.enginePath;
+    if (!engine) {
+        completion(WinovaError(@"Choose a Wine engine first."));
+        return;
+    }
+    NSString *launch = application[@"launch"];
+    NSString *prefixName = application[@"prefix"] ?: @"default";
+    NSString *kind = application[@"kind"] ?: @"file";
+    if (!launch.length) {
+        completion(WinovaError(@"This application does not have a valid launch target."));
+        return;
+    }
+    NSArray<NSString *> *arguments = [kind isEqualToString:@"uri"]
+        ? @[@"start", launch]
+        : @[@"start", @"/unix", launch];
+    NSURL *workingDirectory = [kind isEqualToString:@"uri"]
+        ? [self prefixURLForName:prefixName]
+        : [NSURL fileURLWithPath:launch].URLByDeletingLastPathComponent;
+    dispatch_async(_queue, ^{
+        NSTask *task = [self taskWithEngine:engine
+                                  arguments:arguments
+                           workingDirectory:workingDirectory
+                                 prefixName:prefixName];
+        NSString *lowerName = [application[@"name"] lowercaseString];
+        NSString *lowerLaunch = launch.lowercaseString;
+        if ([lowerName isEqualToString:@"stove"] || [lowerLaunch hasPrefix:@"sgup:"]) {
+            NSMutableDictionary *environment = [task.environment mutableCopy];
+            environment[@"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = @"--disable-gpu --disable-gpu-compositing";
+            task.environment = environment;
+        }
+        [self writeLog:[NSString stringWithFormat:@"Launching %@ in %@", application[@"name"], prefixName]];
+        NSError *error = nil;
+        [task launchAndReturnError:&error];
+        if (!error) {
+            self->_tasks[@(task.processIdentifier)] = task;
+            __weak typeof(self) weakSelf = self;
+            task.terminationHandler = ^(NSTask *finished) {
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf) return;
+                dispatch_async(strongSelf->_queue, ^{
+                    [strongSelf->_tasks removeObjectForKey:@(finished.processIdentifier)];
+                });
+            };
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(error); });
+    });
+}
+
 - (void)openConfiguration:(WinovaCompletion)completion {
     NSString *engine = self.enginePath;
     if (!engine) {
@@ -194,7 +464,10 @@ static NSError *WinovaError(NSString *message) {
         return;
     }
     dispatch_async(_queue, ^{
-        NSTask *task = [self taskWithEngine:engine arguments:@[@"winecfg"] workingDirectory:nil];
+        NSTask *task = [self taskWithEngine:engine
+                                  arguments:@[@"winecfg"]
+                           workingDirectory:nil
+                                 prefixName:@"default"];
         NSError *error = nil;
         [task launchAndReturnError:&error];
         if (!error) self->_tasks[@(task.processIdentifier)] = task;
@@ -289,7 +562,7 @@ static NSError *WinovaError(NSString *message) {
 @implementation WinovaAppDelegate {
     NSWindow *_window;
     WinovaRuntime *_runtime;
-    NSMutableArray<NSMutableDictionary *> *_recent;
+    NSArray<NSDictionary *> *_installedApps;
     NSTableView *_tableView;
     NSTextField *_emptyLabel;
     NSTextView *_logView;
@@ -300,16 +573,18 @@ static NSError *WinovaError(NSString *message) {
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     _runtime = [WinovaRuntime new];
-    NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:@"recentPrograms"] ?: @[];
-    _recent = [[saved filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *item, id bindings) {
-        return [[NSFileManager defaultManager] fileExistsAtPath:item[@"path"] ?: @""];
-    }]] mutableCopy];
+    _installedApps = @[];
     [self configureMenu];
     [self buildWindow];
     [self connectRuntime];
     [_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     [_runtime reportEngineStatus];
+    [self refreshInstalledApps:nil];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+    if (_runtime && _tableView) [self refreshInstalledApps:nil];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return YES; }
@@ -457,7 +732,8 @@ static NSError *WinovaError(NSString *message) {
     NSButton *run = [self button:@"Run Program" action:@selector(chooseProgram:)];
     run.keyEquivalent = @"\r";
     NSButton *install = [self button:@"Install Package" action:@selector(chooseInstaller:)];
-    NSStackView *actions = [NSStackView stackViewWithViews:@[run, install]];
+    NSButton *refresh = [self button:@"Refresh Apps" action:@selector(refreshInstalledApps:)];
+    NSStackView *actions = [NSStackView stackViewWithViews:@[refresh, run, install]];
     actions.spacing = 10;
     NSStackView *header = [NSStackView stackViewWithViews:@[titles, headerSpacer, actions]];
     header.alignment = NSLayoutAttributeCenterY;
@@ -467,15 +743,15 @@ static NSError *WinovaError(NSString *message) {
     __weak typeof(self) weakSelf = self;
     drop.fileHandler = ^(NSURL *url) { [weakSelf launchURL:url]; };
 
-    NSTextField *recentTitle = [NSTextField labelWithString:@"Recent"];
-    recentTitle.font = [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold];
+    NSTextField *installedTitle = [NSTextField labelWithString:@"Installed Apps"];
+    installedTitle.font = [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold];
     [self configureTable];
     NSScrollView *tableScroll = [NSScrollView new];
     tableScroll.documentView = _tableView;
     tableScroll.hasVerticalScroller = YES;
     tableScroll.drawsBackground = NO;
     [tableScroll.heightAnchor constraintGreaterThanOrEqualToConstant:145].active = YES;
-    _emptyLabel = [NSTextField labelWithString:@"Your recently launched apps will appear here."];
+    _emptyLabel = [NSTextField labelWithString:@"No installed apps found. Install a package, then refresh."];
     _emptyLabel.textColor = NSColor.tertiaryLabelColor;
     _emptyLabel.alignment = NSTextAlignmentCenter;
 
@@ -495,7 +771,7 @@ static NSError *WinovaError(NSString *message) {
     [logScroll.heightAnchor constraintEqualToConstant:105].active = YES;
 
     NSStackView *stack = [NSStackView stackViewWithViews:@[
-        header, drop, recentTitle, tableScroll, _emptyLabel, activity, logScroll
+        header, drop, installedTitle, tableScroll, _emptyLabel, activity, logScroll
     ]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
@@ -512,7 +788,7 @@ static NSError *WinovaError(NSString *message) {
         [stack.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-24],
         [header.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
         [drop.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
-        [recentTitle.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
+        [installedTitle.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
         [tableScroll.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
         [_emptyLabel.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
         [activity.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
@@ -525,7 +801,7 @@ static NSError *WinovaError(NSString *message) {
 - (void)configureTable {
     _tableView = [NSTableView new];
     NSArray *columns = @[
-        @[@"name", @"Application", @280], @[@"path", @"Location", @390], @[@"type", @"Type", @60]
+        @[@"name", @"Application", @300], @[@"prefix", @"Environment", @120], @[@"location", @"Location", @300]
     ];
     for (NSArray *definition in columns) {
         NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:definition[0]];
@@ -534,11 +810,11 @@ static NSError *WinovaError(NSString *message) {
         [_tableView addTableColumn:column];
     }
     _tableView.headerView = nil;
-    _tableView.rowHeight = 38;
+    _tableView.rowHeight = 52;
     _tableView.delegate = self;
     _tableView.dataSource = self;
     _tableView.target = self;
-    _tableView.doubleAction = @selector(runSelectedRecent:);
+    _tableView.doubleAction = @selector(runSelectedApplication:);
     _tableView.backgroundColor = NSColor.clearColor;
 }
 
@@ -605,17 +881,46 @@ static NSError *WinovaError(NSString *message) {
     [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[_runtime.prefixURL]];
 }
 
-- (void)runSelectedRecent:(id)sender {
+- (void)refreshInstalledApps:(id)sender {
+    if (sender) [self appendLog:@"Scanning installed applications…"];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSArray<NSDictionary *> *applications = [strongSelf->_runtime installedApplications];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) mainSelf = weakSelf;
+            if (!mainSelf) return;
+            mainSelf->_installedApps = applications;
+            [mainSelf->_tableView reloadData];
+            [mainSelf updateEmptyState];
+            if (sender) {
+                [mainSelf appendLog:[NSString stringWithFormat:@"Found %lu installed application%@.",
+                    (unsigned long)applications.count, applications.count == 1 ? @"" : @"s"]];
+            }
+        });
+    });
+}
+
+- (void)runInstalledButton:(NSButton *)sender {
+    if (sender.tag < 0 || sender.tag >= (NSInteger)_installedApps.count) return;
+    [self launchInstalledApplication:_installedApps[sender.tag]];
+}
+
+- (void)runSelectedApplication:(id)sender {
     NSInteger row = _tableView.clickedRow >= 0 ? _tableView.clickedRow : _tableView.selectedRow;
-    if (row < 0 || row >= (NSInteger)_recent.count) return;
-    NSURL *url = [NSURL fileURLWithPath:_recent[row][@"path"]];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
-        [_recent removeObjectAtIndex:row];
-        [self saveRecent];
-        [self showError:@"This file no longer exists."];
+    if (row < 0 || row >= (NSInteger)_installedApps.count) return;
+    [self launchInstalledApplication:_installedApps[row]];
+}
+
+- (void)launchInstalledApplication:(NSDictionary *)application {
+    if (!_runtime.enginePath) {
+        [self showError:@"Choose a Wine engine first."];
         return;
     }
-    [self launchURL:url];
+    [_runtime launchInstalledApplication:application completion:^(NSError *error) {
+        if (error) [self showError:error.localizedDescription];
+    }];
 }
 
 - (BOOL)isSupported:(NSURL *)url {
@@ -633,30 +938,13 @@ static NSError *WinovaError(NSString *message) {
     }
     [_runtime launchProgram:url completion:^(NSError *error) {
         if (error) [self showError:error.localizedDescription];
-        else [self addRecent:url];
+        else [self appendLog:[NSString stringWithFormat:@"Started %@.", url.lastPathComponent]];
     }];
-}
-
-- (void)addRecent:(NSURL *)url {
-    NSIndexSet *matches = [_recent indexesOfObjectsPassingTest:^BOOL(NSDictionary *item, NSUInteger idx, BOOL *stop) {
-        return [item[@"path"] isEqualToString:url.path];
-    }];
-    if (matches.count) [_recent removeObjectsAtIndexes:matches];
-    [_recent insertObject:[@{@"path": url.path, @"lastOpened": @([NSDate date].timeIntervalSince1970)} mutableCopy]
-                   atIndex:0];
-    if (_recent.count > 20) [_recent removeObjectsInRange:NSMakeRange(20, _recent.count - 20)];
-    [self saveRecent];
-}
-
-- (void)saveRecent {
-    [[NSUserDefaults standardUserDefaults] setObject:_recent forKey:@"recentPrograms"];
-    [_tableView reloadData];
-    [self updateEmptyState];
 }
 
 - (void)updateEmptyState {
-    _emptyLabel.hidden = _recent.count > 0;
-    _tableView.hidden = _recent.count == 0;
+    _emptyLabel.hidden = _installedApps.count > 0;
+    _tableView.hidden = _installedApps.count == 0;
 }
 
 - (void)appendLog:(NSString *)line {
@@ -680,13 +968,44 @@ static NSError *WinovaError(NSString *message) {
     [alert beginSheetModalForWindow:_window completionHandler:nil];
 }
 
-- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView { return _recent.count; }
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView { return _installedApps.count; }
 
 - (NSView *)tableView:(NSTableView *)tableView
    viewForTableColumn:(NSTableColumn *)tableColumn
                   row:(NSInteger)row {
-    NSDictionary *item = _recent[row];
+    NSDictionary *item = _installedApps[row];
     NSTableCellView *cell = [NSTableCellView new];
+    NSString *identifier = tableColumn.identifier;
+    if ([identifier isEqualToString:@"name"]) {
+        NSButton *button = [NSButton buttonWithTitle:item[@"name"] target:self action:@selector(runInstalledButton:)];
+        button.tag = row;
+        button.bordered = NO;
+        button.alignment = NSTextAlignmentLeft;
+        button.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+        button.imagePosition = NSImageLeft;
+        button.imageHugsTitle = YES;
+        button.imageScaling = NSImageScaleProportionallyUpOrDown;
+        NSString *iconPath = item[@"iconPath"] ?: item[@"location"];
+        NSString *iconExtension = iconPath.pathExtension.lowercaseString;
+        NSImage *icon = [@[@"png", @"ico", @"icns", @"jpg", @"jpeg"] containsObject:iconExtension]
+            ? [[NSImage alloc] initWithContentsOfFile:iconPath]
+            : (iconPath.length ? [[NSWorkspace sharedWorkspace] iconForFile:iconPath] : nil);
+        if (!icon || icon.size.width <= 0) {
+            icon = [NSImage imageWithSystemSymbolName:@"app.fill" accessibilityDescription:@"Application"];
+        }
+        icon.size = NSMakeSize(32, 32);
+        button.image = icon;
+        button.toolTip = [NSString stringWithFormat:@"Launch %@", item[@"name"]];
+        button.translatesAutoresizingMaskIntoConstraints = NO;
+        [cell addSubview:button];
+        [NSLayoutConstraint activateConstraints:@[
+            [button.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:6],
+            [button.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-6],
+            [button.topAnchor constraintEqualToAnchor:cell.topAnchor constant:4],
+            [button.bottomAnchor constraintEqualToAnchor:cell.bottomAnchor constant:-4]
+        ]];
+        return cell;
+    }
     NSTextField *label = [NSTextField labelWithString:@""];
     label.lineBreakMode = NSLineBreakByTruncatingMiddle;
     label.translatesAutoresizingMaskIntoConstraints = NO;
@@ -697,18 +1016,14 @@ static NSError *WinovaError(NSString *message) {
         [label.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-8],
         [label.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor]
     ]];
-    NSString *identifier = tableColumn.identifier;
-    if ([identifier isEqualToString:@"name"]) {
-        label.stringValue = [[item[@"path"] lastPathComponent] stringByDeletingPathExtension];
-        label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
-    } else if ([identifier isEqualToString:@"path"]) {
-        label.stringValue = item[@"path"];
+    if ([identifier isEqualToString:@"prefix"]) {
+        label.stringValue = item[@"prefix"] ?: @"default";
+        label.textColor = NSColor.secondaryLabelColor;
+        label.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    } else {
+        label.stringValue = item[@"location"] ?: item[@"launch"] ?: @"";
         label.textColor = NSColor.secondaryLabelColor;
         label.font = [NSFont systemFontOfSize:11];
-    } else {
-        label.stringValue = [item[@"path"] pathExtension].uppercaseString;
-        label.textColor = NSColor.tertiaryLabelColor;
-        label.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightMedium];
     }
     return cell;
 }
@@ -717,6 +1032,16 @@ static NSError *WinovaError(NSString *message) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc > 1 && [[[NSString alloc] initWithUTF8String:argv[1]] isEqualToString:@"--list-apps"]) {
+            WinovaRuntime *runtime = [WinovaRuntime new];
+            for (NSDictionary *application in runtime.installedApplications) {
+                printf("%s\t%s\t%s\n",
+                    [application[@"name"] UTF8String],
+                    [application[@"prefix"] UTF8String],
+                    [application[@"kind"] UTF8String]);
+            }
+            return 0;
+        }
         NSApplication *application = [NSApplication sharedApplication];
         WinovaAppDelegate *delegate = [WinovaAppDelegate new];
         application.delegate = delegate;

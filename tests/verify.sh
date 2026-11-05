@@ -6,6 +6,7 @@ source_files=("$project_dir"/Sources/Winova/*.m)
 
 plutil -lint "$project_dir/Resources/Info.plist"
 zsh -n "$project_dir/scripts/build.sh" "$project_dir/scripts/run.sh"
+zsh -n "$project_dir/scripts/package.sh"
 /usr/bin/clang \
   -fobjc-arc \
   -fsyntax-only \

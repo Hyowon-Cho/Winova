@@ -3,15 +3,17 @@
 Winova is a native macOS launcher for Windows applications. It provides a
 Mac-first interface for selecting a Wine engine, maintaining an isolated
 Windows environment, launching `.exe` and `.msi` files, and reopening recent
-applications.
+applications from an automatically discovered library.
 
 ## Features
 
 - Native AppKit interface for Apple Silicon Macs
 - User-selectable open-source Wine engine
-- Isolated prefix at `~/Library/Application Support/Winova/Prefixes/default`
+- Multiple isolated environments under `~/Library/Application Support/Winova/Prefixes`
 - `.exe` application and `.msi` installer support
-- Recent application library with one-click relaunch
+- Automatic discovery of installed Start Menu applications
+- App icons and one-click launch in the correct environment
+- Manual refresh after installing or removing software
 - Environment configuration, local logs, and Finder access
 - No telemetry or online account
 
@@ -43,7 +45,28 @@ development.
 ```
 
 On first launch, choose a Wine engine. Winova stores the chosen path locally
-and uses a separate prefix, leaving other Wine environments untouched.
+and uses separate environments, leaving unrelated Wine data untouched. Installed
+applications appear in the library automatically; click an app icon or title to
+launch it without entering terminal commands.
+
+## Downloadable archive
+
+Create a compressed macOS application archive and SHA-256 checksum with:
+
+```sh
+./scripts/package.sh
+```
+
+The files are written to `dist/`. The archive contains only `Winova.app`, the
+documentation, and license notices. It does not include a Wine engine, installed
+Windows applications, prefixes, saved sessions, or other personal data.
+
+- [Download Winova 0.1.0 for Apple Silicon](downloads/Winova-0.1.0-macos-arm64.tar.gz)
+- [SHA-256 checksum](downloads/Winova-0.1.0-macos-arm64.tar.gz.sha256)
+
+Current archives are ad-hoc signed development builds and are not
+Apple-notarized. Only open them when you trust the repository and its download
+assets. See [SECURITY.md](SECURITY.md) for the current security model.
 
 ## Project structure
 
@@ -52,6 +75,7 @@ Sources/Winova/       Native macOS source
 Resources/            App metadata and assets
 scripts/              Build and launch helpers
 tests/                 Static project verification
+downloads/             Versioned test builds and checksums
 ```
 
 ## License
