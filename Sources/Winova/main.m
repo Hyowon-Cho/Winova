@@ -572,6 +572,9 @@ static NSError *WinovaError(NSString *message) {
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    NSURL *iconURL = [NSBundle.mainBundle URLForResource:@"AppIcon" withExtension:@"png"];
+    NSImage *appIcon = iconURL ? [[NSImage alloc] initWithContentsOfURL:iconURL] : nil;
+    if (appIcon) NSApp.applicationIconImage = appIcon;
     _runtime = [WinovaRuntime new];
     _installedApps = @[];
     [self configureMenu];

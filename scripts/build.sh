@@ -21,6 +21,7 @@ source_files=("$project_dir"/Sources/Winova/*.m)
 
 cp "$project_dir/Resources/Info.plist" "$contents_dir/Info.plist"
 cp "$project_dir/THIRD_PARTY_NOTICES.md" "$resources_dir/THIRD_PARTY_NOTICES.md"
+cp "$project_dir/Resources/AppIcon.png" "$resources_dir/AppIcon.png"
 
 plutil -lint "$contents_dir/Info.plist"
 codesign --force --sign - --timestamp=none "$app_dir"

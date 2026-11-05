@@ -61,8 +61,8 @@ The files are written to `dist/`. The archive contains only `Winova.app`, the
 documentation, and license notices. It does not include a Wine engine, installed
 Windows applications, prefixes, saved sessions, or other personal data.
 
-- [Download Winova 0.1.0 for Apple Silicon](downloads/Winova-0.1.0-macos-arm64.tar.gz)
-- [SHA-256 checksum](downloads/Winova-0.1.0-macos-arm64.tar.gz.sha256)
+- [Download Winova 1.0.1 for Apple Silicon](downloads/Winova-1.0.1-macos-arm64.tar.gz)
+- [SHA-256 checksum](downloads/Winova-1.0.1-macos-arm64.tar.gz.sha256)
 
 Current archives are ad-hoc signed development builds and are not
 Apple-notarized. Only open them when you trust the repository and its download
